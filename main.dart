@@ -4,14 +4,21 @@ import 'dart:ui';
 import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'offers_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter/rendering.dart';
-import 'package:flutter/services.dart';
 import 'flight_offer.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:intl/intl.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'firestore_service.dart';
+import 'scraper_webview.dart';
+import 'scrape_manager.dart';
+import 'site_config.dart';
 
-// Add at the top of the file (after imports):
+
 final Map<String, String> logoMap = {
   'cleartrip.com': 'assets/logos/cleartrip.png',
   'Cleartrip': 'assets/logos/cleartrip.png',
@@ -29,38 +36,39 @@ final Map<String, String> logoMap = {
   'Goibibo': 'assets/logos/goibibo.png',
   'paytm.com': 'assets/logos/paytm.png',
   'Paytm': 'assets/logos/paytm.png',
-  // Add more mappings as needed
 };
 
-void main() {
+
+final navigatorKey = GlobalKey<NavigatorState>();
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  ScrapeManager.setNavigatorKey(navigatorKey);
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: navigatorKey,
       title: 'Flutter Demo',
+      themeMode: ThemeMode.system,
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
+        brightness: Brightness.light,
+      ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.deepPurple,
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+        brightness: Brightness.dark,
       ),
       home: const SplashScreen(),
     );
@@ -91,6 +99,15 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Map<String, String>> _airports = [];
   bool _loadingAirports = true;
+  
+  // Price fetching state
+  final _firestoreService = FirestoreService();
+  final _currency = NumberFormat.currency(locale: 'en_IN', symbol: '₹', decimalDigits: 0);
+  List<Map<String, dynamic>> _prices = [];
+  bool _loadingPrices = false;
+  bool _fetchingPrices = false;
+  String? _currentRouteKey;
+  String? _lastScrapeSignature; // snapshot of inputs (route + pax + sites) used for last scrape
 
   @override
   void initState() {
@@ -137,33 +154,388 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  String? _buildRouteKey() {
+    if (_selectedSource == null || _selectedDestination == null || _departureDate == null) {
+      return null;
+    }
+    final dateStr = formatDate(_departureDate, format: 'YYYY-MM-DD');
+    return '$_selectedSource-$_selectedDestination-$dateStr';
+  }
+
+  // Build a signature representing all inputs that affect scraping:
+  // route (from-to-date), passengers, and selected websites.
+  String? _buildScrapeSignature() {
+    final routeKey = _buildRouteKey();
+    if (routeKey == null || _selectedWebsites.isEmpty) return null;
+    final sites = List<String>.from(_selectedWebsites)..sort();
+    return [
+      routeKey,
+      'adults=$_adults',
+      'children=$_children',
+      'infants=$_infants',
+      'sites=${sites.join(',')}',
+    ].join('|');
+  }
+
+  // Refresh button behavior in cheapest-prices section:
+  // - If inputs (route/pax/sites) changed since last scrape → rescrape (_triggerPriceFetching)
+  // - Otherwise → just re-pull from Firestore (_fetchPrices)
+  Future<void> _onRefreshPricesPressed() async {
+    final signatureNow = _buildScrapeSignature();
+    if (signatureNow == null) {
+      // No valid route or no sites; just try to fetch whatever exists.
+      await _fetchPrices();
+      return;
+    }
+
+    final inputsChanged = _lastScrapeSignature == null || _lastScrapeSignature != signatureNow;
+    if (inputsChanged) {
+      // Inputs changed → full scrape for new combination.
+      await _triggerPriceFetching();
+    } else {
+      // Inputs unchanged → only refresh from Firestore.
+      await _fetchPrices();
+    }
+  }
+
+  Future<void> _fetchPrices() async {
+    final routeKey = _buildRouteKey();
+    if (routeKey == null || _selectedWebsites.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _loadingPrices = true;
+      _currentRouteKey = routeKey;
+    });
+
+    try {
+      print('🔍 Fetching prices for route: $routeKey');
+      print('🔍 Selected websites: $_selectedWebsites');
+      
+      // Fetch prices from Firestore
+      final prices = await _firestoreService.getTopPrices(routeKey, limit: 20);
+      
+      print('📊 Found ${prices.length} prices in Firestore');
+      if (prices.isNotEmpty) {
+        print('📊 Available site names: ${prices.map((p) => p['siteName']).toList()}');
+        print('📊 All prices:');
+        for (var price in prices) {
+          print('   - ${price['siteName']}: ₹${price['price']}');
+        }
+      } else {
+        print('⚠️ No prices found in Firestore for route: $routeKey');
+        print('💡 Make sure prices have been scraped and saved to Firestore first');
+      }
+      
+      // Filter prices to only show selected websites (case-insensitive matching)
+      final filteredPrices = prices.where((price) {
+        final siteName = (price['siteName'] as String? ?? '').toLowerCase().trim();
+        return _selectedWebsites.any((selected) => 
+          selected.toLowerCase().trim() == siteName
+        );
+      }).toList();
+
+      print('✅ Filtered to ${filteredPrices.length} matching prices');
+      
+      // If no filtered prices but we have prices, show all for debugging
+      if (filteredPrices.isEmpty && prices.isNotEmpty) {
+        print('⚠️ No prices match selected websites. Showing all prices for debugging.');
+        if (mounted) {
+          setState(() {
+            _prices = prices.take(10).toList(); // Show first 10 for debugging
+            _loadingPrices = false;
+          });
+        }
+        return;
+      }
+
+      if (mounted) {
+        setState(() {
+          _prices = filteredPrices;
+          _loadingPrices = false;
+        });
+      }
+    } catch (e) {
+      print('❌ Error fetching prices: $e');
+      if (mounted) {
+        setState(() {
+          _loadingPrices = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error fetching prices: $e')),
+        );
+      }
+    }
+  }
+
+  // Helper to create SiteConfig from flightWebsite
+  // Prefer tuned configs from lib/site_config.dart (with site-specific selectors/JS)
+  // and fall back to a generic heuristic-based scraper when no tuned config exists.
+  SiteConfig? _getSiteConfigForWebsite(String websiteName) {
+    // Find the website entry from flightWebsites to get a stable id/name
+    final website = flightWebsites.firstWhere(
+      (w) => (w['name'] as String?)?.toLowerCase() == websiteName.toLowerCase(),
+      orElse: () => {},
+    );
+
+    if (website.isEmpty) return null;
+
+    final siteId = (website['id'] as String? ?? websiteName)
+        .toLowerCase()
+        .replaceAll(' ', '');
+    final name = website['name'] as String? ?? websiteName;
+
+    // 1) Try to use a tuned SiteConfig from lib/site_config.dart (if available)
+    //    This is where the site-specific CSS selectors and custom priceJs live.
+    try {
+      final tuned = sites.firstWhere(
+        (s) => s.id.toLowerCase() == siteId || s.name.toLowerCase() == name.toLowerCase(),
+      );
+
+      // We intentionally ignore tuned.urlTemplate here because we already
+      // build a full concrete URL via flightWebsites.buildSearchUrl. That
+      // URL will be injected later as urlTemplate for scraping.
+      return SiteConfig(
+        id: tuned.id,
+        name: tuned.name,
+        urlTemplate: '', // will be replaced with the concrete URL per scrape
+        priceSelectors: tuned.priceSelectors,
+        priceJs: tuned.priceJs,
+        debug: tuned.debug,
+      );
+    } catch (_) {
+      // No tuned SiteConfig; fall through to generic scraper.
+    }
+
+    // 2) Generic fallback: provide broad price-related selectors and let
+    //    ScrapeManager's polling heuristics (_buildPollingJs) do the heavy lifting.
+    //
+    //    We intentionally do NOT provide a custom priceJs here so that
+    //    ScrapeManager can:
+    //      - poll multiple times while dynamic content loads
+    //      - scan many candidates and pick the cheapest valid fare
+    //      - run the shared _sanitizePrice() filter before saving
+    final genericSelectors = <String>[
+      '[class*="price"]',
+      '[id*="price"]',
+      '[class*="amount"]',
+      '[class*="fare"]',
+      '[class*="cost"]',
+      '[data-price]',
+      '[data-amount]',
+    ];
+
+    return SiteConfig(
+      id: siteId,
+      name: name,
+      urlTemplate: '', // Not used since we build the concrete URL separately
+      priceSelectors: genericSelectors,
+      priceJs: null,   // use ScrapeManager _buildPollingJs heuristics
+      debug: false,
+    );
+  }
+
+  Future<void> _triggerPriceFetching() async {
+    if (_fetchingPrices) return;
+    
+    final routeKey = _buildRouteKey();
+    if (routeKey == null || _selectedWebsites.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please fill all required fields and select at least one website')),
+      );
+      return;
+    }
+
+    setState(() {
+      _fetchingPrices = true;
+    });
+
+    try {
+      print('🚀 Starting price scraping for route: $routeKey');
+      print('🚀 Selected websites: $_selectedWebsites');
+
+      // Remember the exact input combination used for this scrape
+      _lastScrapeSignature = _buildScrapeSignature();
+      
+      // Build search params
+      final searchParams = {
+        'origin': _selectedSource ?? '',
+        'destination': _selectedDestination ?? '',
+        'dateDDMMYYYY': formatDate(_departureDate, format: 'DDMMYYYY'),
+        'dateYYYYMMDD': formatDate(_departureDate, format: 'YYYYMMDD'),
+        'dateDDMMYYYYcompact': formatDate(_departureDate, format: 'DDMMYYYY'),
+        'dateDDMMYYYYdash': formatDate(_departureDate, format: 'DDMMYYYYdash'),
+        'dateYYYY-MM-DD': formatDate(_departureDate, format: 'YYYY-MM-DD'),
+        'dateDDMMYYYYslash': formatDate(_departureDate, format: 'DD/MM/YYYY'),
+        'dateDDMMYY': formatDate(_departureDate, format: 'DDMMYY'),
+        'returnDateDDMMYYYY': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYY') : '',
+        'returnDateYYYYMMDD': _isRoundTrip ? formatDate(_returnDate, format: 'YYYYMMDD') : '',
+        'returnDateDDMMYYYYcompact': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYY') : '',
+        'returnDateDDMMYYYYdash': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYYdash') : '',
+        'returnDateYYYY-MM-DD': _isRoundTrip ? formatDate(_returnDate, format: 'YYYY-MM-DD') : '',
+        'returnDateDDMMYYYYslash': _isRoundTrip ? formatDate(_returnDate, format: 'DD/MM/YYYY') : '',
+        'returnDateDDMMYY': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYY') : '',
+        'tripType': _isRoundTrip ? 'roundtrip' : 'oneway',
+        'adults': _adults.toString(),
+        'children': _children.toString(),
+        'infants': _infants.toString(),
+      };
+      
+      // Build SiteConfig list for parallel scraping
+      final siteConfigs = <SiteConfig>[];
+      for (final websiteName in _selectedWebsites) {
+        // Get website config
+        final website = flightWebsites.firstWhere(
+          (w) => (w['name'] as String?)?.toLowerCase() == websiteName.toLowerCase(),
+          orElse: () => {},
+        );
+        
+        if (website.isEmpty) {
+          print('⚠️ Website config not found for: $websiteName');
+          continue;
+        }
+        
+        // Build URL
+        final buildSearchUrl = website['buildSearchUrl'] as Function?;
+        if (buildSearchUrl == null) {
+          print('⚠️ buildSearchUrl not found for: $websiteName');
+          continue;
+        }
+        
+        final url = buildSearchUrl(searchParams, _airports) as String;
+        if (url.isEmpty) {
+          print('⚠️ Empty URL for: $websiteName');
+          continue;
+        }
+        
+        // Get SiteConfig for scraping
+        final siteConfig = _getSiteConfigForWebsite(websiteName);
+        if (siteConfig == null) {
+          print('⚠️ SiteConfig not found for: $websiteName');
+          continue;
+        }
+        
+        // Create SiteConfig with URL
+        siteConfigs.add(SiteConfig(
+          id: siteConfig.id,
+          name: siteConfig.name,
+          urlTemplate: url, // Use actual URL as template
+          priceSelectors: siteConfig.priceSelectors,
+          priceJs: siteConfig.priceJs,
+          debug: siteConfig.debug,
+        ));
+      }
+      
+      if (siteConfigs.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No valid websites to scrape')),
+        );
+        return;
+      }
+      
+      // Use ScrapeManager for fast parallel scraping
+      print('🚀 Starting parallel scraping for ${siteConfigs.length} websites...');
+      final results = await ScrapeManager.scrapeRoute(
+        routeKey,
+        siteConfigs,
+        concurrency: 5, // Increased concurrency for faster scraping
+        cacheTtl: const Duration(minutes: 15),
+      );
+      
+      final successCount = results.values.where((p) => p != null).length;
+      print('✅ Scraping complete. Successfully scraped $successCount/${siteConfigs.length} websites');
+      
+      // Fetch updated prices
+      await _fetchPrices();
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Scraped $successCount website(s). Found ${_prices.length} price(s).'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      print('❌ Error in _triggerPriceFetching: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error scraping: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _fetchingPrices = false;
+        });
+      }
+    }
+  }
+
+  String _formatUpdated(Timestamp? ts) {
+    if (ts == null) return 'Updated: --';
+    final dateTime = ts.toDate();
+    final now = DateTime.now();
+    final diff = now.difference(dateTime);
+    if (diff.inMinutes < 60) {
+      return 'Updated: ${diff.inMinutes}m ago';
+    } else if (diff.inHours < 24) {
+      return 'Updated: ${diff.inHours}h ago';
+    }
+    return 'Updated: ${DateFormat('dd MMM yyyy, HH:mm').format(dateTime)}';
+  }
+
+  bool _isStale(Timestamp? ts) {
+    if (ts == null) return true;
+    return DateTime.now().difference(ts.toDate()) > const Duration(hours: 24);
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: _selectedIndex == 0 ? _buildHome(context) : _buildOffers(context),
-      bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _selectedIndex,
-        onTap: (index) {
+    final scheme = Theme.of(context).colorScheme;
+    return WillPopScope(
+      onWillPop: () async {
+        // If we're on the Offers tab, go back to Home instead of exiting
+        if (_selectedIndex != 0) {
           setState(() {
-            _selectedIndex = index;
+            _selectedIndex = 0;
           });
-        },
-        items: const [
-          BottomNavigationBarItem(
-            icon: Icon(Icons.home),
-            label: 'Home',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.local_offer),
-            label: 'Offers',
-          ),
-        ],
+          return false;
+        }
+        return true;
+      },
+      child: Scaffold(
+        body: _selectedIndex == 0 ? _buildHome(context) : _buildOffers(context),
+        bottomNavigationBar: BottomNavigationBar(
+          currentIndex: _selectedIndex,
+          onTap: (index) {
+            setState(() {
+              _selectedIndex = index;
+            });
+          },
+          items: const [
+            BottomNavigationBarItem(
+              icon: Icon(Icons.home),
+              label: 'Home',
+            ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.local_offer),
+              label: 'Offers',
+            ),
+          ],
+        ),
+        backgroundColor: scheme.background,
       ),
-      backgroundColor: const Color(0xFFF7F7F7),
     );
   }
 
   Widget _buildHome(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final selectedBg = scheme.primary;
+    final selectedFg = scheme.onPrimary;
+    final unselectedBg = scheme.surfaceVariant;
+    final unselectedFg = scheme.onSurface;
     return SafeArea(
       child: Stack(
         children: [
@@ -176,7 +548,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: Container(
               width: 420,
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: scheme.surface,
                 borderRadius: BorderRadius.circular(24),
                 boxShadow: [
                   BoxShadow(
@@ -215,18 +587,18 @@ class _HomeScreenState extends State<HomeScreen> {
                         Expanded(
                           child: ElevatedButton(
                             style: ElevatedButton.styleFrom(
-                                backgroundColor: !_isRoundTrip ? Colors.orange : Colors.white,
-                                foregroundColor: !_isRoundTrip ? Colors.white : Colors.orange,
-                              shape: const RoundedRectangleBorder(
-                                borderRadius: BorderRadius.only(
+                                backgroundColor: !_isRoundTrip ? selectedBg : unselectedBg,
+                                foregroundColor: !_isRoundTrip ? selectedFg : unselectedFg,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: const BorderRadius.only(
                                   topLeft: Radius.circular(32),
                                   bottomLeft: Radius.circular(32),
                                 ),
-                                  side: BorderSide(color: Colors.orange, width: 2),
+                                  side: BorderSide(color: scheme.primary, width: 2),
                               ),
                                 elevation: !_isRoundTrip ? 4 : 0,
                                 padding: const EdgeInsets.symmetric(vertical: 18),
-                                shadowColor: Colors.orange.withOpacity(0.18),
+                                shadowColor: scheme.primary.withOpacity(0.18),
                             ),
                             onPressed: () => setState(() => _isRoundTrip = false),
                               child: const Text(
@@ -243,14 +615,14 @@ class _HomeScreenState extends State<HomeScreen> {
                         Expanded(
                           child: ElevatedButton(
                             style: ElevatedButton.styleFrom(
-                                backgroundColor: _isRoundTrip ? Colors.orange : Colors.white,
-                                foregroundColor: _isRoundTrip ? Colors.white : Colors.orange,
-                              shape: const RoundedRectangleBorder(
-                                borderRadius: BorderRadius.only(
+                                backgroundColor: _isRoundTrip ? selectedBg : unselectedBg,
+                                foregroundColor: _isRoundTrip ? selectedFg : unselectedFg,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: const BorderRadius.only(
                                   topRight: Radius.circular(32),
                                   bottomRight: Radius.circular(32),
                                 ),
-                                  side: BorderSide(color: Colors.orange, width: 2),
+                                  side: BorderSide(color: scheme.primary, width: 2),
                               ),
                                 elevation: _isRoundTrip ? 4 : 0,
                                 padding: const EdgeInsets.symmetric(vertical: 18),
@@ -430,7 +802,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         onPressed: _selectedWebsites.isEmpty
                             ? null
                             : () async {
-                                print('DEBUG: _departureDate = [32m$_departureDate[0m, _returnDate = [32m$_returnDate[0m');
+                                print('DEBUG: _departureDate = \u001b[32m$_departureDate\u001b[0m, _returnDate = \u001b[32m$_returnDate\u001b[0m');
                                 if (_selectedSource == null || _selectedSource!.isEmpty ||
                                     _selectedDestination == null || _selectedDestination!.isEmpty ||
                                     _departureDate == null) {
@@ -439,20 +811,22 @@ class _HomeScreenState extends State<HomeScreen> {
                                   );
                                   return;
                                 }
+
+                                // Just build params and go straight to the WebView tabs.
                                 print('DEBUG: searchParams =');
                                 print({
                                   'origin': _selectedSource ?? '',
                                   'destination': _selectedDestination ?? '',
                                   'dateDDMMYYYY': formatDate(_departureDate, format: 'DDMMYYYY'),
                                   'dateYYYYMMDD': formatDate(_departureDate, format: 'YYYYMMDD'),
-                                    'dateDDMMYYYYcompact': formatDate(_departureDate, format: 'DDMMYYYY'),
+                                  'dateDDMMYYYYcompact': formatDate(_departureDate, format: 'DDMMYYYY'),
                                   'dateDDMMYYYYdash': formatDate(_departureDate, format: 'DDMMYYYYdash'),
                                   'dateYYYY-MM-DD': formatDate(_departureDate, format: 'YYYY-MM-DD'),
                                   'dateDDMMYYYYslash': formatDate(_departureDate, format: 'DD/MM/YYYY'),
                                   'dateDDMMYY': formatDate(_departureDate, format: 'DDMMYY'),
                                   'returnDateDDMMYYYY': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYY') : '',
                                   'returnDateYYYYMMDD': _isRoundTrip ? formatDate(_returnDate, format: 'YYYYMMDD') : '',
-                                    'returnDateDDMMYYYYcompact': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYY') : '',
+                                  'returnDateDDMMYYYYcompact': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYY') : '',
                                   'returnDateDDMMYYYYdash': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYYdash') : '',
                                   'returnDateYYYY-MM-DD': _isRoundTrip ? formatDate(_returnDate, format: 'YYYY-MM-DD') : '',
                                   'returnDateDDMMYYYYslash': _isRoundTrip ? formatDate(_returnDate, format: 'DD/MM/YYYY') : '',
@@ -461,9 +835,10 @@ class _HomeScreenState extends State<HomeScreen> {
                                   'adults': _adults.toString(),
                                   'children': _children.toString(),
                                   'infants': _infants.toString(),
-                                    'departureDate': _departureDate,
-                                    'returnDate': _returnDate,
+                                  'departureDate': _departureDate,
+                                  'returnDate': _returnDate,
                                 });
+
                                 final result = await Navigator.of(context).push(
                                   MaterialPageRoute(
                                     builder: (_) => WebViewTabsScreen(
@@ -473,14 +848,14 @@ class _HomeScreenState extends State<HomeScreen> {
                                         'destination': _selectedDestination ?? '',
                                         'dateDDMMYYYY': formatDate(_departureDate, format: 'DDMMYYYY'),
                                         'dateYYYYMMDD': formatDate(_departureDate, format: 'YYYYMMDD'),
-                                          'dateDDMMYYYYcompact': formatDate(_departureDate, format: 'DDMMYYYY'),
+                                        'dateDDMMYYYYcompact': formatDate(_departureDate, format: 'DDMMYYYY'),
                                         'dateDDMMYYYYdash': formatDate(_departureDate, format: 'DDMMYYYYdash'),
                                         'dateYYYY-MM-DD': formatDate(_departureDate, format: 'YYYY-MM-DD'),
                                         'dateDDMMYYYYslash': formatDate(_departureDate, format: 'DD/MM/YYYY'),
                                         'dateDDMMYY': formatDate(_departureDate, format: 'DDMMYY'),
                                         'returnDateDDMMYYYY': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYY') : '',
                                         'returnDateYYYYMMDD': _isRoundTrip ? formatDate(_returnDate, format: 'YYYYMMDD') : '',
-                                          'returnDateDDMMYYYYcompact': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYY') : '',
+                                        'returnDateDDMMYYYYcompact': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYY') : '',
                                         'returnDateDDMMYYYYdash': _isRoundTrip ? formatDate(_returnDate, format: 'DDMMYYYYdash') : '',
                                         'returnDateYYYY-MM-DD': _isRoundTrip ? formatDate(_returnDate, format: 'YYYY-MM-DD') : '',
                                         'returnDateDDMMYYYYslash': _isRoundTrip ? formatDate(_returnDate, format: 'DD/MM/YYYY') : '',
@@ -489,8 +864,8 @@ class _HomeScreenState extends State<HomeScreen> {
                                         'adults': _adults.toString(),
                                         'children': _children.toString(),
                                         'infants': _infants.toString(),
-                                          'departureDate': _departureDate,
-                                          'returnDate': _returnDate,
+                                        'departureDate': _departureDate,
+                                        'returnDate': _returnDate,
                                       },
                                       airports: _airports,
                                       initialState: {
@@ -506,6 +881,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                     ),
                                   ),
                                 );
+
                                 if (result is Map<String, dynamic>) {
                                   setState(() {
                                     _selectedSource = result['selectedSource'];
@@ -525,25 +901,176 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                     ),
-                      const SizedBox(height: 24),
+                    const SizedBox(height: 24),
+                    // Price Display Section (one-way only)
+                    if (!_isRoundTrip &&
+                        _selectedSource != null &&
+                        _selectedDestination != null &&
+                        _departureDate != null &&
+                        _selectedWebsites.isNotEmpty) ...[
                       Divider(),
-                      const SizedBox(height: 8),
-                      Text('Coupons', style: TextStyle(fontFamily: 'Teko', fontWeight: FontWeight.bold, fontSize: 24, color: Colors.orange)),
-                      FutureBuilder<String>(
-                        future: rootBundle.loadString('assets/Offers.json'),
-                        builder: (context, snapshot) {
-                          if (!snapshot.hasData) {
-                            return const Center(child: CircularProgressIndicator());
-                          }
-                          final Map<String, dynamic> jsonResult = json.decode(snapshot.data!);
-                          final offers = FlightOffer.fromJsonList(jsonResult);
-                          offers.sort((a, b) => b.savings.compareTo(a.savings));
-                          final topOffers = offers.take(5).toList();
-                          return Column(
-                            children: topOffers.map((offer) => HomeCouponCard(offer: offer)).toList(),
-                          );
-                        },
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            'Cheapest Prices',
+                            style: TextStyle(
+                              fontFamily: 'Teko',
+                              fontWeight: FontWeight.bold,
+                              fontSize: 24,
+                              color: Colors.orange[800],
+                            ),
+                          ),
+                          if (!_loadingPrices && !_fetchingPrices)
+                            TextButton.icon(
+                              onPressed: _onRefreshPricesPressed,
+                              icon: const Icon(Icons.refresh, size: 18),
+                              label: const Text('Refresh'),
+                              style: TextButton.styleFrom(
+                                foregroundColor: Colors.orange,
+                              ),
+                            ),
+                        ],
                       ),
+                      const SizedBox(height: 12),
+                      if (_loadingPrices || _fetchingPrices)
+                        const Padding(
+                          padding: EdgeInsets.all(24.0),
+                          child: Center(child: CircularProgressIndicator()),
+                        )
+                      else if (_prices.isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.all(24.0),
+                          child: Column(
+                            children: [
+                              Icon(Icons.flight_takeoff, size: 48, color: Colors.grey[400]),
+                              const SizedBox(height: 12),
+                              Text(
+                                'No prices found',
+                                style: TextStyle(color: Colors.grey[600], fontSize: 16, fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'Route: $_currentRouteKey',
+                                style: TextStyle(color: Colors.grey[500], fontSize: 12),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Selected websites: ${_selectedWebsites.join(", ")}',
+                                style: TextStyle(color: Colors.grey[500], fontSize: 12),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 16),
+                              Text(
+                                'Prices need to be scraped and saved to Firestore.\nCheck the console for debugging info.',
+                                style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 16),
+                              ElevatedButton.icon(
+                                onPressed: _triggerPriceFetching,
+                                icon: const Icon(Icons.search),
+                                label: const Text('Fetch Prices'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.orange,
+                                  foregroundColor: Colors.white,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      else
+                        ..._prices.map((priceData) {
+                          final ts = priceData['timestamp'] as Timestamp?;
+                          final price = (priceData['price'] as num?)?.toDouble() ?? 0;
+                          final siteName = priceData['siteName'] as String? ?? 'Unknown';
+                          final url = priceData['url'] as String? ?? '';
+                          final stale = _isStale(ts);
+                          final index = _prices.indexOf(priceData);
+
+                          return Card(
+                            margin: const EdgeInsets.only(bottom: 12),
+                            elevation: 2,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: ListTile(
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                              leading: CircleAvatar(
+                                backgroundColor: Colors.orange,
+                                foregroundColor: Colors.white,
+                                child: Text(
+                                  '${index + 1}',
+                                  style: const TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                              ),
+                              title: Text(
+                                siteName,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16,
+                                ),
+                              ),
+                              subtitle: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    _currency.format(price),
+                                    style: TextStyle(
+                                      fontSize: 18,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.orange[800],
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Row(
+                                    children: [
+                                      Text(
+                                        _formatUpdated(ts),
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.grey[600],
+                                        ),
+                                      ),
+                                      if (stale) ...[
+                                        const SizedBox(width: 8),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                          decoration: BoxDecoration(
+                                            color: Colors.red.shade100,
+                                            borderRadius: BorderRadius.circular(4),
+                                          ),
+                                          child: Text(
+                                            'STALE',
+                                            style: TextStyle(
+                                              color: Colors.red.shade800,
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ],
+                                  ),
+                                ],
+                              ),
+                              trailing: const Icon(Icons.chevron_right, color: Colors.orange),
+                              onTap: () {
+                                if (url.isNotEmpty) {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) => _PriceWebViewPage(url: url, title: siteName),
+                                    ),
+                                  );
+                                }
+                              },
+                            ),
+                          );
+                        }).toList(),
+                    ],
                     ],
                   ),
                 ),
@@ -648,11 +1175,26 @@ class _AirportSearchDelegate extends SearchDelegate<Map<String, String>?> {
   final String hint;
   _AirportSearchDelegate({required this.airports, required this.hint}) : super(searchFieldLabel: hint);
 
+  // Make sure the search text is always high-contrast and readable
+  @override
+  TextStyle? get searchFieldStyle => const TextStyle(
+        color: Colors.black,
+        fontSize: 16,
+      );
+
   @override
   ThemeData appBarTheme(BuildContext context) {
     final theme = Theme.of(context);
     return theme.copyWith(
+      appBarTheme: theme.appBarTheme.copyWith(
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black,
+        iconTheme: const IconThemeData(color: Colors.black),
+      ),
       inputDecorationTheme: const InputDecorationTheme(
+        filled: true,
+        fillColor: Colors.white,
+        hintStyle: TextStyle(color: Colors.grey),
         border: InputBorder.none,
       ),
       textTheme: theme.textTheme.copyWith(
@@ -706,26 +1248,42 @@ class _AirportSearchDelegate extends SearchDelegate<Map<String, String>?> {
 
   Widget _buildList(List<Map<String, String>> filtered) {
     if (filtered.isEmpty) {
-      return const Center(child: Text('No results found'));
+      return const Center(
+        child: Text(
+          'No results found',
+          style: TextStyle(color: Colors.black87),
+        ),
+      );
     }
-    return ListView.separated(
-      itemCount: filtered.length,
-      separatorBuilder: (_, __) => const Divider(height: 1),
-      itemBuilder: (context, index) {
-        final airport = filtered[index];
-        return ListTile(
-          title: Text(
-            '${airport['city']} - ${airport['name']}',
-            style: const TextStyle(
-              fontWeight: FontWeight.bold,
-              fontSize: 17,
-              color: Colors.black,
+    return Container(
+      color: Colors.white,
+      child: ListView.separated(
+        itemCount: filtered.length,
+        separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.grey),
+        itemBuilder: (context, index) {
+          final airport = filtered[index];
+          return ListTile(
+            tileColor: Colors.white,
+            title: Text(
+              '${airport['city']} - ${airport['name']}',
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 17,
+                color: Colors.black,
+              ),
             ),
-          ),
-          subtitle: Text(airport['code']!, style: const TextStyle(fontFamily: 'Teko', fontSize: 14)),
-          onTap: () => close(context, airport),
-        );
-      },
+            subtitle: Text(
+              airport['code']!,
+              style: TextStyle(
+                fontFamily: 'Teko',
+                fontSize: 14,
+                color: Colors.grey.shade800,
+              ),
+            ),
+            onTap: () => close(context, airport),
+          );
+        },
+      ),
     );
   }
 }
@@ -2059,6 +2617,59 @@ class HomeCouponCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _PriceWebViewPage extends StatefulWidget {
+  const _PriceWebViewPage({super.key, required this.url, required this.title});
+
+  final String url;
+  final String title;
+
+  @override
+  State<_PriceWebViewPage> createState() => _PriceWebViewPageState();
+}
+
+class _PriceWebViewPageState extends State<_PriceWebViewPage> {
+  late final WebViewController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..loadRequest(Uri.parse(widget.url));
+  }
+
+  Future<bool> _handleBack() async {
+    if (await _controller.canGoBack()) {
+      await _controller.goBack();
+      return false;
+    }
+    return true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return WillPopScope(
+      onWillPop: _handleBack,
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(widget.title),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () async {
+              if (await _controller.canGoBack()) {
+                await _controller.goBack();
+              } else {
+                if (mounted) Navigator.of(context).pop();
+              }
+            },
+          ),
+        ),
+        body: WebViewWidget(controller: _controller),
       ),
     );
   }

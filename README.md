@@ -118,6 +118,3 @@ flutter run
 
 ---
 
-## License
-
-MIT
